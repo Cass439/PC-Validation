@@ -1,80 +1,85 @@
-from __future__ import annotations
-
+import streamlit as st
+import pandas as pd
+from openpyxl import load_workbook
 from io import BytesIO
 
-import pandas as pd
-import streamlit as st
-
-from src.catalog_processor import CatalogProcessingError, process_workbook
-
-st.set_page_config(page_title="PC Validation", page_icon="📘", layout="wide")
+st.set_page_config(page_title="PC Validation", layout="wide")
 
 st.title("PC Validation")
-st.caption(
-    "Upload a Partner Catalog workbook plus the zero-sales CSV, then set Price = 0 for GTINs that match BARCODE rows where TOTAL_SALES is 0."
-)
+st.write("Upload a Partner Catalog Excel file and a sales CSV. Any GTIN matched to BARCODE with TOTAL_SALES = 0 will have Price set to 0.")
 
 catalog_file = st.file_uploader("Upload Partner Catalog (.xlsx)", type=["xlsx"])
-sales_file = st.file_uploader("Upload zero-sales file (.csv)", type=["csv"])
+sales_file = st.file_uploader("Upload Sales CSV", type=["csv"])
 
-if not catalog_file or not sales_file:
-    st.info("Upload both files to continue.")
-    st.stop()
+def normalize(value):
+    return str(value).strip().upper()
 
-catalog_bytes = catalog_file.getvalue()
-sales_bytes = sales_file.getvalue()
+def find_header_row(sheet, required_headers):
+    for row in sheet.iter_rows(min_row=1, max_row=10):
+        values = [cell.value for cell in row]
+        normalized = [normalize(v) if v is not None else "" for v in values]
+        if all(header in normalized for header in required_headers):
+            return row[0].row
+    return None
 
-preview_col1, preview_col2 = st.columns(2)
-with preview_col1:
-    st.subheader("Partner Catalog preview")
+if catalog_file and sales_file:
     try:
-        catalog_preview = pd.read_excel(BytesIO(catalog_bytes), sheet_name=0, nrows=10)
-        st.dataframe(catalog_preview, use_container_width=True)
-    except Exception as exc:
-        st.error(f"Could not preview the Partner Catalog: {exc}")
-        st.stop()
+        sales_df = pd.read_csv(sales_file)
+        sales_df.columns = [c.strip().upper() for c in sales_df.columns]
 
-with preview_col2:
-    st.subheader("Sales CSV preview")
-    try:
-        sales_preview = pd.read_csv(BytesIO(sales_bytes)).head(10)
-        st.dataframe(sales_preview, use_container_width=True)
-    except Exception as exc:
-        st.error(f"Could not preview the sales CSV: {exc}")
-        st.stop()
+        if "BARCODE" not in sales_df.columns or "TOTAL_SALES" not in sales_df.columns:
+            st.error("Sales CSV must contain BARCODE and TOTAL_SALES columns.")
+            st.stop()
 
-process_clicked = st.button("Process files", type="primary")
-
-if process_clicked:
-    try:
-        output_bytes, report = process_workbook(
-            catalog_bytes=catalog_bytes,
-            sales_csv_bytes=sales_bytes,
+        zero_sales_barcodes = set(
+            sales_df.loc[pd.to_numeric(sales_df["TOTAL_SALES"], errors="coerce").fillna(0) == 0, "BARCODE"]
+            .astype(str)
+            .str.strip()
         )
-    except CatalogProcessingError as exc:
-        st.error(str(exc))
-        st.stop()
-    except Exception as exc:
-        st.error(f"Unexpected error: {exc}")
-        st.stop()
 
-    st.success(
-        f"Matched {report.matched_rows} GTIN rows and updated Price on {report.updated_rows} rows."
-    )
+        wb = load_workbook(catalog_file)
+        ws = wb[wb.sheetnames[0]]
 
-    metric1, metric2, metric3 = st.columns(3)
-    metric1.metric("Catalog rows processed", report.total_rows)
-    metric2.metric("Matched GTIN rows", report.matched_rows)
-    metric3.metric("Price updates", report.updated_rows)
+        header_row_num = find_header_row(ws, ["GTIN", "PRICE"])
+        if header_row_num is None:
+            st.error("Could not find a header row with GTIN and Price in the Excel file.")
+            st.stop()
 
-    st.write("Detected columns")
-    st.code(
-        f"Sheet: {report.sheet_name}\nGTIN: {report.gtin_column}\nPrice: {report.price_column}\nSales barcode column: {report.barcode_column}\nSales value column: {report.sales_column}"
-    )
+        headers = {}
+        for cell in ws[header_row_num]:
+            if cell.value is not None:
+                headers[normalize(cell.value)] = cell.column
 
-    st.download_button(
-        label="Download updated Partner Catalog",
-        data=output_bytes,
-        file_name=catalog_file.name.replace(".xlsx", "_updated.xlsx"),
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        gtin_col = headers.get("GTIN")
+        price_col = headers.get("PRICE")
+
+        if not gtin_col or not price_col:
+            st.error("Could not locate GTIN and Price columns.")
+            st.stop()
+
+        updated_count = 0
+
+        for row in range(header_row_num + 1, ws.max_row + 1):
+            gtin_value = ws.cell(row=row, column=gtin_col).value
+            if gtin_value is None:
+                continue
+
+            gtin_str = str(gtin_value).strip()
+            if gtin_str in zero_sales_barcodes:
+                ws.cell(row=row, column=price_col).value = 0
+                updated_count += 1
+
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        st.success(f"Done. Updated {updated_count} rows.")
+        st.download_button(
+            "Download updated Partner Catalog",
+            data=output,
+            file_name="updated_partner_catalog.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    except Exception as e:
+        st.error(f"Error: {e}")
